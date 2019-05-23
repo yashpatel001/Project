@@ -1,0 +1,247 @@
+#!/bin/sh
+################################################################################
+#   PROJECT :-  Digital Cockpit System
+#   AUTHOR  :-  Jagdish Prajapati (jagdish.prajapati@lnttechservices.com)
+#   COMPANY :-  L&T Technology and Services
+#   VERSION :-  1.3
+#   DATE    :-  16-Nov-2018
+#   DESCRIPTION :-
+#       This script developed to support multiple display using IVI shell and 
+#   wayland/weston graphic server.
+################################################################################
+
+
+if ! echo $PATH | grep "/usr/bin" > /dev/null; then
+    export PATH=$PATH:/usr/bin
+fi
+
+APP_STAT_IPDEV_LR_SF_RS=
+
+killproc() {
+    option=
+    pid=
+    if [ ${1:0:1} == "-" ]; then
+        option=$1
+    else
+        pid=`/bin/pidof $1`
+    fi
+    if [ "$option" != "" ]; then
+        if [ $# -ge 2 ]; then 
+            pid=`/bin/pidof $2`
+        fi
+    fi
+        [ "$pid" != "" ] && kill $option $pid
+	return $?
+}
+
+getdimofscreen()
+{
+    if ! LayerManagerControl get screens | grep "Screen $1" > /dev/null; then
+        return 1
+    fi
+    width=`LayerManagerControl get screen $1 | grep resolution | cut -d',' -f1 | cut -d'=' -f2`
+    height=`LayerManagerControl get screen $1 | grep resolution | cut -d',' -f2 | cut -d'=' -f2`
+    echo "$width $height"
+    return 0
+}
+
+getdimofsurface()
+{
+    if ! LayerManagerControl get surfaces | grep "Surface $1" > /dev/null; then
+        return 1
+    fi
+    width=`LayerManagerControl get surface $1 | grep "original size" | cut -d',' -f1 | cut -d'=' -f2`
+    height=`LayerManagerControl get surface $1 | grep "original size" | cut -d',' -f2 | cut -d'=' -f2`
+    echo "$width $height"
+    return 0
+}
+
+createlayers()
+{
+    screens=`LayerManagerControl get screens | grep "^- Screen" | cut -d' ' -f3`
+    for screen in $screens; do
+        lyr=`expr \( $screen + 1 \) \* 100`
+        res=`getdimofscreen $screen`
+        if [ -z "$res" ]; then
+            echo "Error: Unable to get resolution for screen $screen"
+            continue
+        fi
+		if ! LayerManagerControl get layers | grep "Layer $lyr" > /dev/null; then
+            LayerManagerControl create layer $lyr $res
+		fi
+		
+        if ! LayerManagerControl get layers | grep "Layer $lyr" > /dev/null; then
+			echo "ERROR: can't create Layer ($lyr) for screen $screen!!"
+		else
+            LayerManagerControl set layer $lyr destination region 0 0 $res
+            LayerManagerControl set screen $screen render order $lyr
+            LayerManagerControl set layer $lyr visibility 1
+            echo "Layer ($lyr) is successfully created with resolution (${res/" "/X})!!"
+		fi
+
+    done
+    return 0
+}
+
+waitforsurface()
+{
+    if [ $# -eq 0 ];then
+	return 1
+    fi
+    a=0
+    while [ $a -lt 5 ];do
+    	if ! LayerManagerControl get surfaces | grep "Surface $1" > /dev/null; then
+      	    sleep 1
+	else
+	    break
+    	fi
+	a=`expr $a + 1`
+    done
+    return 0
+}
+
+createsurfaces()
+{
+    count=100
+    for app in $@; do
+        lyr=$count
+        surf=`expr $count \* 10`
+        count=`expr $count + 100`
+        stat=0
+        ipdev=
+        sres=
+
+        if [ "$app" != "-" ] && [ -f "$app" ]; then
+            if [ -x "$app" ]; then 
+                QT_IVI_SURFACE_ID=$surf $app -platform wayland &
+                echo "$app : Started!!"
+                waitforsurface $surf
+            else
+                echo "Error: $app : Not executable!!"
+            fi
+        fi
+
+        if ! LayerManagerControl get layers | grep "Layer $lyr" > /dev/null; then
+            lyr="-"
+        fi
+        if ! LayerManagerControl get surfaces | grep "Surface $surf" > /dev/null; then
+            surf="-"
+        else
+            sres=`getdimofsurface $surf`
+            if [ -z "$sres" ]; then
+                echo "Error: Unable to get size of surface $surf"
+            else
+                LayerManagerControl set surface $surf source region 0 0 $sres
+                LayerManagerControl set surface $surf destination region 0 0 $sres
+                LayerManagerControl set layer $lyr render order $surf
+                LayerManagerControl set surface $surf visibility 0
+                if echo $app | grep -iE "_full|-full" > /dev/null; then
+                    stat=1
+                fi
+
+                if echo $app | grep -E "_touch|-touch" > /dev/null; then
+                    ipdev=${app/${app%touch*}/}
+                fi
+                echo "Surface ($surf) is created successfully with resolution (${sres/" "/X})"
+            fi
+        fi
+        APP_STAT_IPDEV_LR_SF_RS="$APP_STAT_IPDEV_LR_SF_RS $app:$stat:$ipdev:$lyr:$surf:${sres/" "/X}"
+    done
+    return 0
+}
+
+makefullscreen()
+{
+    for app in $APP_STAT_IPDEV_LR_SF_RS; do
+        lyr=`echo $app | cut -d':' -f4`
+        if [ "$lyr" != "-" ]; then
+            res=`echo $app | cut -d':' -f6`
+            stat=`echo $app | cut -d':' -f2`
+            res=${res/"X"/" "}
+            if [ ! -z "$res" ] && [ $stat -eq 1 ]; then
+                LayerManagerControl set layer $lyr source region 0 0 $res
+            fi
+        fi
+    done
+    return 0
+}
+
+showsurfaces()
+{
+    for app in $APP_STAT_IPDEV_LR_SF_RS; do
+        surf=`echo $app | cut -d':' -f5`
+        if [ "$surf" != "-" ]; then
+            LayerManagerControl set surface $surf visibility 1
+        fi
+    done
+    return 0
+}
+
+startweston() {
+	if [ "$1" == "force" ]; then
+        killproc weston
+		echo "Weston is restarting!!"
+        sleep 1
+	    if pidof weston > /dev/null; then
+            killproc weston
+        fi
+    fi
+
+	if ! pidof weston > /dev/null; then
+		#openvt -f -- weston --backend=drm-backend.so --idle-time=0 & 
+		/etc/init.d/weston start
+		sleep 2
+		if ! pidof weston > /dev/null; then
+			echo "ERROR: weston is unable to start!!"
+			return 1
+        else 
+            echo "Weston is restarted!!"
+		fi
+	else
+		echo "Weston is running!!"
+	fi
+	return 0
+}
+
+
+deletlastprocess() {
+	if [ -f "$XDG_RUNTIME_DIR/tmpIVIapps##" ]; then                                                                       
+		last_apps=`cat $XDG_RUNTIME_DIR/tmpIVIapps##`
+	else 
+		last_apps=
+	fi                          
+	echo $@ > "$XDG_RUNTIME_DIR/tmpIVIapps##"                                 
+	if [ -z "$last_apps" ]; then
+		return 0
+	fi 
+	echo "$last_apps"                                                                           
+	for app in $last_apps; do
+        if pidof $app > /dev/null; then
+            killproc -2 $app 
+        fi
+	done                        
+	return 0                                 
+}
+
+
+
+if [ 0 -eq $# ]
+then
+        echo "ERROR: Required to pass QT application name as argument!!"
+        echo "Usage: $0 <app1> [app2] ..."
+        echo
+        exit 1
+fi
+
+deletlastprocess $@
+startweston force
+echo "Creating layers..."
+createlayers
+echo "Creating surfaces..."
+createsurfaces $@
+echo "Setting full size of application if required ..."
+makefullscreen
+echo "Making visible all surfaces..."
+showsurfaces
+exit 0
+
